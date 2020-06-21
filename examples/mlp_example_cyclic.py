@@ -8,7 +8,7 @@ from pysnn.connection import Linear
 from pysnn.neuron import FedeNeuron, Input
 from pysnn.learning import FedeSTDP
 from pysnn.encoding import PoissonEncoder
-from pysnn.network import SNNNetwork
+from pysnn.network import SpikingModule
 from pysnn.datasets import OR, BooleanNoise, Intensity
 
 
@@ -26,7 +26,7 @@ intensity = 40
 num_workers = 0
 batch_size = 1
 
-# Neuronal Dynamics
+# Neuronal dynamics
 thresh = 0.8
 v_rest = 0
 alpha_v = 0.2
@@ -49,7 +49,7 @@ a = 0.5
 #########################################################
 # Cyclic Network
 #########################################################
-class Network(SNNNetwork):
+class Network(SpikingModule):
     r"""Cyclic network, serves the purpose of showing the possibility of constructing cyclic graphs with PySNN. 
 
     This network is by no means an example of a well performing network.
@@ -66,16 +66,13 @@ class Network(SNNNetwork):
         # Layer 1
         self.mlp1_c = Linear(n_in, n_hidden, *c_dynamics)
         self.neuron1 = FedeNeuron((batch_size, 1, n_hidden), *n_dynamics)
-        self.add_layer("fc1", self.mlp1_c, self.neuron1)
 
         # Layer 2
         self.mlp2_c = Linear(n_hidden, n_out, *c_dynamics)
         self.neuron2 = FedeNeuron((batch_size, 1, n_out), *n_dynamics)
-        self.add_layer("fc2", self.mlp2_c, self.neuron2)
 
         # Backwards connection
         self.mlp2_backwards = Linear(n_out, n_hidden, *c_dynamics)
-        self.add_layer("fc2_backwards", self.mlp2_backwards, self.neuron1)
 
     def forward(self, input):
         x, t = self.input(input)
@@ -93,6 +90,10 @@ class Network(SNNNetwork):
 
         return x
 
+    def reset_state(self):
+        for module in self.spiking_children():
+            module.reset_state()
+
 
 #########################################################
 # Dataset
@@ -109,7 +110,7 @@ train_dataset = OR(
     data_encoder=PoissonEncoder(duration, dt),
     data_transform=data_transform,
     lbl_transform=lbl_transform,
-    repeats=n_in / 2,
+    repeats=int(n_in / 2),
 )
 train_dataloader = DataLoader(
     train_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
@@ -121,26 +122,27 @@ train_dataloader = DataLoader(
 #########################################################
 device = torch.device("cpu")
 net = Network()
+# TODO: trace_graph doesn't work yet for cyclic connections
+layers, _, _, _ = net.trace_graph(next(iter(train_dataloader))[0][..., 0])
 
 # Add graph to tensorboard
 logger = SummaryWriter()
 input = next(iter(train_dataloader))
-input = input[0][:, :, :, 0]
+input = input[0][..., 0]
 logger.add_graph(net, input)
 
 # Learning rule definition
-layers = net.layer_state_dict()
 learning_rule = FedeSTDP(layers, lr, w_init, a)
 
 # Training loop
 out = []
 for batch in tqdm(train_dataloader):
     single_out = []
-    sample, label = batch
+    sample, label = batch[0], batch[1]
 
     # Iterate over input's time dimension
     for idx in range(sample.shape[-1]):
-        input = sample[:, :, :, idx]
+        input = sample[..., idx].to(device)
         single_out.append(net(input))
 
         learning_rule.step()

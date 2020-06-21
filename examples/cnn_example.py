@@ -4,7 +4,7 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import DataLoader
 
-from pysnn.network import SNNNetwork
+from pysnn.network import SpikingModule
 from pysnn.connection import Conv2d
 from pysnn.neuron import FedeNeuron, Input
 from pysnn.learning import FedeSTDP
@@ -25,7 +25,7 @@ sample_length = 300
 num_workers = 0
 batch_size = 2
 
-# Neuronal Dynamics
+# Neuronal dynamics
 thresh = 0.8
 v_rest = 0
 alpha_v = 0.2
@@ -48,7 +48,7 @@ a = 0.5
 #########################################################
 # Network
 #########################################################
-class Network(SNNNetwork):
+class Network(SpikingModule):
     def __init__(self):
         super(Network, self).__init__()
 
@@ -60,17 +60,14 @@ class Network(SNNNetwork):
         # Layer 1
         self.conv1 = Conv2d(2, 4, 5, (34, 34), *c_dynamics, padding=1, stride=1)
         self.neuron1 = FedeNeuron((batch_size, 4, 32, 32), *n_dynamics)
-        self.add_layer("conv1", self.conv1, self.neuron1)
 
         # Layer 2
         self.conv2 = Conv2d(4, 8, 5, (32, 32), *c_dynamics, padding=1, stride=2)
         self.neuron2 = FedeNeuron((batch_size, 8, 15, 15), *n_dynamics)
-        self.add_layer("conv2", self.conv2, self.neuron2)
 
         # Layer out
         self.conv3 = Conv2d(8, 1, 3, (15, 15), *c_dynamics)
         self.neuron3 = FedeNeuron((batch_size, 1, 13, 13), *n_dynamics)
-        self.add_layer("conv3", self.conv3, self.neuron3)
 
     def forward(self, input):
         x, t = self.input(input)
@@ -89,6 +86,10 @@ class Network(SNNNetwork):
         x, t = self.neuron3(x, t)
 
         return x, t
+
+    def reset_state(self):
+        for module in self.spiking_children():
+            module.reset_state()
 
 
 #########################################################
@@ -119,13 +120,15 @@ if torch.cuda.is_available():
     net = net.to(torch.float16).cuda()
 else:
     device = torch.device("cpu")
-learning_rule = FedeSTDP(net.layer_state_dict(), lr, w_init, a)
+
+layers, _, _, _ = net.trace_graph(next(iter(train_dataloader))[0][..., 0])
+learning_rule = FedeSTDP(layers, lr, w_init, a)
 
 output = []
 for batch in tqdm(train_dataloader):
     input = batch[0]
     for idx in range(input.shape[-1]):
-        x = input[:, :, :, :, idx].to(device)
+        x = input[..., idx].to(device)
         out, _ = net(x)
         output.append(out)
 
@@ -133,6 +136,7 @@ for batch in tqdm(train_dataloader):
 
     net.reset_state()
 
+    # Break because this would take way too long
     break
 
 print(torch.stack(output, dim=-1).shape)

@@ -1,21 +1,27 @@
 import gym
 import torch
-from ray import tune
-from ray.tune.schedulers import ASHAScheduler
-from ray.tune.suggest.bayesopt import BayesOptSearch
 
-from pysnn.network import SNNNetwork
+from pysnn.network import SpikingModule
 from pysnn.neuron import AdaptiveLIFNeuron, LIFNeuron
 from pysnn.connection import Linear
 from pysnn.learning import MSTDPET
 
 
+# Do we want hyperparameter optimization?
+# TODO: not sure this works correctly
+optimization = False
+if optimization:
+    from ray import tune
+    from ray.tune.schedulers import ASHAScheduler
+    from ray.tune.suggest.bayesopt import BayesOptSearch
+
+
 ########################################################
-# Spiking network
+# Network
 ########################################################
-class SpikingNet(SNNNetwork):
+class Network(SpikingModule):
     def __init__(self, n_in_dynamics, n_hid_dynamics, n_out_dynamics, c_dynamics):
-        super(SpikingNet, self).__init__()
+        super(Network, self).__init__()
 
         # Input layer
         # 4-dimensional observation of + and -, so 8 neurons
@@ -35,29 +41,22 @@ class SpikingNet(SNNNetwork):
         self.linear1 = Linear(8, 64, *c_dynamics)
         self.linear2 = Linear(64, 1, *c_dynamics)
 
-        # Layers (for learning rule)
-        # Consist of connection and post-synaptic neuron
-        self.add_layer("fc1", self.linear1, self.neuron1)
-        self.add_layer("fc2", self.linear2, self.neuron2)
-
-    def forward(self, x):
-        # Encode before passing to input layer
-        x = self._encode(x)
-        spikes, trace = self.neuron0(x)
+    def forward(self, input):
+        # Input
+        x, t = self.neuron0(input)
 
         # Hidden layer
         # Connection trace (2nd argument) is not used
-        x, _ = self.linear1(spikes, trace)
-        spikes, trace = self.neuron1(x)
+        x, t = self.linear1(x, t)
+        x, t = self.neuron1(x)
 
         # Output layer
-        x, _ = self.linear2(spikes, trace)
-        spikes, trace = self.neuron2(x)
+        x, t = self.linear2(x, t)
+        x, t = self.neuron2(x)
 
-        # Decode into binary action (so nothing)
-        return self._decode(spikes)
+        return x
 
-    def _encode(self, x):
+    def encode(self, x):
         # Repeat the input
         x = x.repeat(1, 1, 2)
 
@@ -68,16 +67,23 @@ class SpikingNet(SNNNetwork):
         # Make absolute
         return x.abs().float()
 
-    def _decode(self, x):
+    def decode(self, x):
         return x.byte()
 
+    def reset_state(self):
+        for module in self.spiking_children():
+            module.reset_state()
+
     def step(self, obs, env, rule, render=False):
-        # Observation is first positional argument
-        # Environment is second
-        # Learning rule is third
-        # TODO: or step away from args, or use kwargs? (this is just for PL convention)
+        # Encode observation
         obs = torch.from_numpy(obs).view(1, 1, -1)
+        obs = self.encode(obs)
+
+        # Push through network
         action = self.forward(obs)
+
+        # Decode
+        action = self.decode(action)
 
         # Optional render of environment
         if render:
@@ -88,7 +94,6 @@ class SpikingNet(SNNNetwork):
         obs, reward, done, _ = env.step(action)
 
         # Do learning step
-        rule.update_state()
         rule.step(reward)
 
         # Return stepped environment and its returns
@@ -135,12 +140,13 @@ def main(config):
         config["tau_t2"],
     ]
     conns = [config["batch_size"], config["dt"], config["delay"]]
-    lr = [config["a_pre"], config["a_post"], config["lr"], config["tau_e_trace"]]
+    lr = [config["lr"], config["a_pre"], config["a_post"], config["tau_e_trace"]]
 
     # Build network
     # Build learning rule from network layers
-    network = SpikingNet(neuron_in, neuron_hid, neuron_out, conns)
-    rule = MSTDPET(network.layer_state_dict(), *lr)
+    net = Network(neuron_in, neuron_hid, neuron_out, conns)
+    layers, _, _, _ = net.trace_graph(torch.zeros((1, 1, 8)))
+    rule = MSTDPET(layers, *lr)
 
     # Build env
     env = gym.make("CartPole-v1")
@@ -151,21 +157,25 @@ def main(config):
 
     # Simulation loop
     for step in range(config["steps"]):
-        obs, reward, done, env, rule = network.step(obs, env, rule, render=False)
+        obs, reward, done, env, rule = net.step(obs, env, rule, render=False)
         episode_reward += reward
 
         # Episode end
         if done:
             obs = env.reset()
-            network.reset_state()
+            net.reset_state()
             rule.reset_state()
-            tune.track.log(reward=episode_reward)
+            if optimization:
+                tune.track.log(reward=episode_reward)
             episode_reward = 0.0
 
     # Cleanup
     env.close()
 
 
+#########################################################
+# Training
+#########################################################
 if __name__ == "__main__":
     # Fixed parameters
     config = {
@@ -180,45 +190,75 @@ if __name__ == "__main__":
         "steps": 10000,
     }
 
-    # Search space for Bayesian Optimization
-    space = {
-        "thresh2": (0.0, 1.0),
-        "alpha_v0": (0.0, 2.0),
-        "alpha_v1": (0.0, 2.0),
-        "alpha_v2": (0.0, 2.0),
-        "alpha_t0": (0.0, 2.0),
-        "alpha_t1": (0.0, 2.0),
-        "alpha_t2": (0.0, 2.0),
-        "alpha_thresh0": (0.0, 2.0),
-        "alpha_thresh1": (0.0, 2.0),
-        "tau_v0": (0.0, 1.0),
-        "tau_v1": (0.0, 1.0),
-        "tau_v2": (0.0, 1.0),
-        "tau_t0": (0.0, 1.0),
-        "tau_t1": (0.0, 1.0),
-        "tau_t2": (0.0, 1.0),
-        "tau_thresh0": (0.0, 1.0),
-        "tau_thresh1": (0.0, 1.0),
-        "a_pre": (0.0, 2.0),
-        "lr": (1e-6, 1e-2),
-        "tau_e_trace": (0.0, 1.0),
-    }
+    if optimization:
+        # Search space for Bayesian Optimization
+        space = {
+            "thresh2": (0.0, 1.0),
+            "alpha_v0": (0.0, 2.0),
+            "alpha_v1": (0.0, 2.0),
+            "alpha_v2": (0.0, 2.0),
+            "alpha_t0": (0.0, 2.0),
+            "alpha_t1": (0.0, 2.0),
+            "alpha_t2": (0.0, 2.0),
+            "alpha_thresh0": (0.0, 2.0),
+            "alpha_thresh1": (0.0, 2.0),
+            "tau_v0": (0.0, 1.0),
+            "tau_v1": (0.0, 1.0),
+            "tau_v2": (0.0, 1.0),
+            "tau_t0": (0.0, 1.0),
+            "tau_t1": (0.0, 1.0),
+            "tau_t2": (0.0, 1.0),
+            "tau_thresh0": (0.0, 1.0),
+            "tau_thresh1": (0.0, 1.0),
+            "a_pre": (0.0, 2.0),
+            "lr": (1e-6, 1e-2),
+            "tau_e_trace": (0.0, 1.0),
+        }
 
-    # Run hyperparameter search
-    search = BayesOptSearch(
-        space,
-        max_concurrent=6,
-        metric="reward",
-        mode="max",
-        utility_kwargs={"kind": "ucb", "kappa": 2.5, "xi": 0.0},
-    )
-    scheduler = ASHAScheduler(metric="reward", mode="max")
-    tune.run(
-        main,
-        num_samples=100,
-        scheduler=scheduler,
-        search_alg=search,
-        config=config,
-        verbose=1,
-        local_dir="ray_runs",
-    )
+        # Run hyperparameter search
+        search = BayesOptSearch(
+            space,
+            max_concurrent=6,
+            metric="reward",
+            mode="max",
+            utility_kwargs={"kind": "ucb", "kappa": 2.5, "xi": 0.0},
+        )
+        scheduler = ASHAScheduler(metric="reward", mode="max")
+        tune.run(
+            main,
+            num_samples=100,
+            scheduler=scheduler,
+            search_alg=search,
+            config=config,
+            verbose=1,
+            local_dir="ray_runs",
+        )
+    else:
+        # No space, just fixed hyperparameters
+        config.update(
+            {
+                "thresh2": 0.8,
+                "alpha_v0": 1.0,
+                "alpha_v1": 1.0,
+                "alpha_v2": 1.0,
+                "alpha_t0": 1.0,
+                "alpha_t1": 1.0,
+                "alpha_t2": 1.0,
+                "alpha_thresh0": 1.0,
+                "alpha_thresh1": 1.0,
+                "tau_v0": 0.8,
+                "tau_v1": 0.8,
+                "tau_v2": 0.8,
+                "tau_t0": 0.8,
+                "tau_t1": 0.8,
+                "tau_t2": 0.8,
+                "tau_thresh0": 0.8,
+                "tau_thresh1": 0.8,
+                "a_pre": 1.0,
+                "lr": 0.0001,
+                "tau_e_trace": 0.8,
+            }
+        )
+
+        # Run main
+        main(config)

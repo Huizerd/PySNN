@@ -33,11 +33,11 @@ class LearningRule:
         self.layers = layers
         self.defaults = defaults
 
-    def update_state(self):
+    def update_state(self, *args, **kwargs):
         r"""Update state parameters of LearningRule based on latest network forward pass."""
         pass
 
-    def reset_state(self):
+    def reset_state(self, *args, **kwargs):
         r"""Reset state parameters of LearningRule."""
         pass
 
@@ -74,6 +74,8 @@ class LearningRule:
             )
 
         # Perform actual multiplication
+        # TODO: not sure whether this works correctly for Conv2d connections,
+        # cnn_mstdpet_example.py gives an error
         if isinstance(conn, _Linear):
             pre = pre.transpose(2, 1)
         elif isinstance(conn, _ConvNd):
@@ -89,7 +91,7 @@ class LearningRule:
         return output.transpose(2, 1)
 
     def reduce_connections(self, tensor, conn, red_method=torch.mean):
-        r"""Reduces the tensor along the dimensions that represent seperate connections to an element of the weight Tensor.
+        r"""Reduces the tensor along the dimensions that represent separate connections to an element of the weight Tensor.
 
         The function used for reducing has to be a callable that can be applied to single axes of a tensor.
         
@@ -129,6 +131,9 @@ class OnlineSTDP(LearningRule):
     def __init__(
         self, layers, lr=0.001, a_plus=1.0, a_min=1.0,
     ):
+        assert (a_plus >= 0) and (
+            a_min >= 0
+        ), "'a_plus' and 'a_min' should both be positive."
         params = dict(lr=lr, a_plus=a_plus, a_min=a_min)
         super(OnlineSTDP, self).__init__(layers, params)
 
@@ -138,7 +143,7 @@ class OnlineSTDP(LearningRule):
         dw = params["a_plus"] * self.pre_mult_post(
             pre_trace, post_spike, layer.connection
         )
-        dw = params["a_plus"] * self.pre_mult_post(
+        dw -= params["a_min"] * self.pre_mult_post(
             pre_spike, post_trace, layer.connection
         )
         layer.connection.weight += params["lr"] * self.reduce_connections(
@@ -156,72 +161,56 @@ class MSTDPET(LearningRule):
     Update rule can be applied at any desired time step.
 
     :param layers: OrderedDict containing state dicts for each layer.
-    :param a_pre: Scaling factor for presynaptic spikes influence on the eligibilty trace.
-    :param a_post: Scaling factor for postsynaptic spikes influence on the eligibilty trace.
+    :param a_pre: Scaling factor for presynaptic spikes influence on the eligibility trace.
+    :param a_post: Scaling factor for postsynaptic spikes influence on the eligibility trace.
     :param lr: Learning rate.
     :param e_trace_decay: Decay factor for the eligibility trace.
     """
 
-    def __init__(self, layers, a_pre, a_post, lr, e_trace_decay):
-        self.check_layers(layers)
+    def __init__(self, layers, lr=0.001, a_pre=1.0, a_post=1.0, e_trace_decay=0.99):
+        assert (a_pre >= 0) and (
+            a_post >= 0
+        ), "'a_pre' and 'a_post' should both be positive."
+        params = dict(lr=lr, a_pre=a_pre, a_post=a_post, e_trace_decay=e_trace_decay)
+        super(MSTDPET, self).__init__(layers, params)
 
-        # Collect desired tensors from state dict in a layer object
-        for key, layer in layers.items():
-            new_layer = {}
-            new_layer["pre_spikes"] = layer["connection"]["spikes"]
-            new_layer["pre_trace"] = layer["connection"]["trace"]
-            new_layer["post_spikes"] = layer["neuron"]["spikes"]
-            new_layer["post_trace"] = layer["neuron"]["trace"]
-            new_layer["weight"] = layer["connection"]["weight"]
-            new_layer["e_trace"] = torch.zeros_like(layer["connection"]["trace"])
-            new_layer["type"] = layer["type"]
-            layers[key] = new_layer
-
-        self.a_pre = a_pre
-        self.a_post = a_post
-        self.lr = lr
-        self.e_trace_decay = e_trace_decay
-
-        # To possibly later support groups, without changing interface
-        defaults = {
-            "a_pre": a_pre,
-            "a_post": a_post,
-            "lr": lr,
-            "e_trace_decay": e_trace_decay,
-        }
-
-        super(MSTDPET, self).__init__(layers, defaults)
-
-    def update_state(self):
+    def update_state(self, layer, params, *args, **kwargs):
         r"""Update eligibility trace based on pre and postsynaptic spiking activity.
-        
-        This function has to be called manually at desired times, often after each timestep.
         """
+        pre_trace, post_trace = layer.presynaptic.trace, layer.postsynaptic.trace
+        pre_spike, post_spike = layer.presynaptic.spikes, layer.postsynaptic.spikes
 
-        for layer in self.layers.values():
-            # Update eligibility trace
-            layer["e_trace"] *= self.e_trace_decay
-            layer["e_trace"] += self.a_pre * self.pre_mult_post(
-                layer["pre_trace"], layer["post_spikes"], layer["type"]
-            )
-            layer["e_trace"] -= self.a_post * self.pre_mult_post(
-                layer["pre_spikes"], layer["post_trace"], layer["type"]
-            )
+        # Update eligibility trace
+        layer.connection.e_trace *= params["e_trace_decay"]
+        de_trace = params["a_pre"] * self.pre_mult_post(
+            pre_trace, post_spike, layer.connection
+        )
+        de_trace -= params["a_post"] * self.pre_mult_post(
+            pre_spike, post_trace, layer.connection
+        )
+        # TODO: reduction here?
+        layer.connection.e_trace += de_trace
 
     def reset_state(self):
         for layer in self.layers.values():
-            layer["e_trace"].fill_(0)
+            layer.connection.e_trace.fill_(0)
 
-    def step(self, reward):
+    def weight_update(self, layer, params, reward, *args, **kwargs):
+        # TODO: shape
+        layer.connection.weight += (
+            params["lr"]
+            * reward
+            * self.reduce_connections(layer.connection.e_trace, layer.connection)
+        )
+
+    def step(self, reward, *args, **kwargs):
         r"""Performs single learning step.
         
         :param reward: Scalar reward value.
         """
-
-        # TODO: add weight clamping?
-        for layer in self.layers.values():
-            dw = self.reduce_connections(layer["e_trace"], layer["type"])
-            layer["weight"] += self.lr * reward * dw.view(*layer["weight"].shape)
+        for l in self.layers.values():
+            self.update_state(l, self.defaults, args, kwargs)
+            self.weight_update(l, self.defaults, reward, args, kwargs)
 
 
 #########################################################
@@ -238,51 +227,34 @@ class FedeSTDP(LearningRule):
     :param a: Stability parameter, a < 1.
     """
 
-    def __init__(self, layers, lr, w_init, a):
-        assert lr > 0, "Learning rate should be positive."
-        assert (a <= 1) and (a >= 0), "For FedeSTDP 'a' should fall between 0 and 1."
+    def __init__(self, layers, lr=1e-4, w_init=0.5, a=0):
+        assert (a >= 0) and (a <= 1), "For FedeSTDP 'a' should fall between 0 and 1."
 
-        # Check layer formats
-        self.check_layers(layers)
+        params = dict(lr=lr, w_init=w_init, a=a)
+        super(FedeSTDP, self).__init__(layers, params)
 
-        # Set default hyper parameters
-        self.lr = lr
-        self.w_init = w_init
-        self.a = a
+    def weight_update(self, layer, params, *args, **kwargs):
+        # Normalize presynaptic trace
+        # TODO: shape correct?
+        # TODO: why doesn't presynaptic trace work? There shouldn't be any difference with connection trace, right?
+        # trace = layer.presynaptic.trace.view(-1, *layer.connection.weight.shape)
+        trace = layer.connection.trace.view(-1, *layer.connection.weight.shape)
+        norm_trace = trace / trace.max()
 
-        # To possibly later support groups, without changing interface
-        defaults = {"lr": lr, "w_init": w_init, "a": a}
+        # LTP and LTD
+        dw = layer.connection.weight - params["w_init"]
 
-        # Select only necessary parameters
-        for key, layer in layers.items():
-            new_layer = {}
-            new_layer["trace"] = layer["connection"]["trace"]
-            new_layer["weight"] = layer["connection"]["weight"]
-            layers[key] = new_layer
+        # LTP computation
+        ltp_w = torch.exp(-dw)
+        ltp_t = torch.exp(norm_trace) - params["a"]
+        ltp = ltp_w * ltp_t
 
-        super(FedeSTDP, self).__init__(layers, defaults)
+        # LTD computation
+        ltd_w = -(torch.exp(dw))
+        ltd_t = torch.exp(1 - norm_trace) - params["a"]
+        ltd = ltd_w * ltd_t
 
-    def step(self):
-        r"""Performs single learning step."""
-        for layer in self.layers.values():
-            w = layer["weight"]
-
-            # Normalize trace
-            trace = layer["trace"].view(-1, *w.shape)
-            norm_trace = trace / trace.max()
-
-            # LTP and LTD
-            dw = w - self.w_init
-
-            # LTP computation
-            ltp_w = torch.exp(-dw)
-            ltp_t = torch.exp(norm_trace) - self.a
-            ltp = ltp_w * ltp_t
-
-            # LTD computation
-            ltd_w = -(torch.exp(dw))
-            ltd_t = torch.exp(1 - norm_trace) - self.a
-            ltd = ltd_w * ltd_t
-
-            # Perform weight update
-            layer["weight"] += self.lr * (ltp + ltd).mean(0)
+        # Perform weight update
+        # TODO: why no reduce here? Is FedeSTDP a special case in combination with Conv2d?
+        # layer.connection.weight += params["lr"] * self.reduce_connections(ltp + ltd, layer.connection)
+        layer.connection.weight += params["lr"] * (ltp + ltd).mean(0)

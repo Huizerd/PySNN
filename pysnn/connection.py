@@ -47,7 +47,9 @@ class BaseConnection(SpikingModule):
         self.register_buffer("dt", torch.tensor(dt, dtype=torch.float))
 
         # State parameters
+        # TODO: including e_trace here is probably the easiest...
         self.register_buffer("trace", torch.empty(*shape, dtype=torch.float))
+        self.register_buffer("e_trace", torch.empty(*shape, dtype=torch.float))
         self.register_buffer("delay", torch.empty(*shape, dtype=torch.float))
         self.register_buffer("spikes", torch.empty(*shape, dtype=torch.bool))
 
@@ -62,6 +64,7 @@ class BaseConnection(SpikingModule):
     def reset_state(self):
         r"""Set state Parameters (e.g. trace) to their resting state."""
         self.trace.fill_(0)
+        self.e_trace.fill_(0)
         self.delay.fill_(0)
         self.spikes.fill_(False)
 

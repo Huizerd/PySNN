@@ -15,7 +15,9 @@ docsrc/_build/
 experiments/
 build/
 dist/
-*/runs/
+**/runs/
+**/ray_runs/
+nmnist/
 
 # Files
 trial.py

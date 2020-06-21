@@ -27,7 +27,7 @@ intensity = 100
 num_workers = 0
 batch_size = 1
 
-# Neuronal Dynamics
+# Neuronal dynamics
 thresh = 1.0
 v_rest = 0.0
 alpha_v = 1.0
@@ -77,7 +77,8 @@ class Network(SpikingModule):
         return x
 
     def reset_state(self):
-        pass
+        for module in self.spiking_children():
+            module.reset_state()
 
 
 #########################################################
@@ -120,7 +121,7 @@ for batch in tqdm(train_dataloader):
 
     # Iterate over input's time dimension
     for idx in range(sample.shape[-1]):
-        input = sample[..., idx]
+        input = sample[..., idx].to(device)
         _ = net(input)
 
         sp_n0.append(input.flatten())

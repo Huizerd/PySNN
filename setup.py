@@ -21,7 +21,6 @@ extras = {
         "tqdm",
         "ray[tune]",
         "ray[debug]",
-        "requests",
         "bayesian-optimization",
     ],
     "tests": ["pytest", "coverage", "pytest-cov"],
